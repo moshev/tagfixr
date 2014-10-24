@@ -15,15 +15,19 @@ const char *ENCODINGS[] = {
     "SHIFT-JIS",
     "EUC-JP",
     "SJIS-OPEN",
-    "GB18030",
     "UTF8",
-    "UTF16",
     NULL
 };
 
 void fix(const char *file);
 
-static size_t id3_strlen(const id3_latin1_t *text) {
+static size_t id3_latin1len(const id3_latin1_t *text) {
+    size_t len = 0;
+    while (*text++) len++;
+    return len;
+}
+
+static size_t id3_stringlen(const id3_ucs4_t *text) {
     size_t len = 0;
     while (*text++) len++;
     return len;
@@ -44,6 +48,10 @@ int walkfn(const char *fpath, const struct stat *sb, int typeflag) {
                         exit(1);
                     }
                 } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+                if (WIFSIGNALED(status)) {
+                    fprintf(stderr, "Child died with signal %d\n", (int)(WTERMSIG(status)));
+                    exit(1);
+                }
             } else if (child == 0) {
                 fix(fpath);
                 exit(0);
@@ -57,13 +65,17 @@ int walkfn(const char *fpath, const struct stat *sb, int typeflag) {
 }
 
 int check_latin1(const id3_latin1_t *text, size_t len);
+int check_string(const id3_ucs4_t *text, size_t len);
 int guess_enc_latin1(const id3_latin1_t *text, size_t len, id3_ucs4_t **otext, size_t *olen, int enchint);
 union id3_field *fix_latin1(union id3_field *fld);
 union id3_field *fix_latin1full(union id3_field *fld);
 union id3_field *fix_latin1list(union id3_field *fld);
+union id3_field *fix_string(union id3_field *fld);
+union id3_field *fix_stringfull(union id3_field *fld);
+union id3_field *fix_stringlist(union id3_field *fld);
 
 void fix(const char *file) {
-    struct id3_file *id3f = id3_file_open(file, ID3_FILE_MODE_READONLY);
+    struct id3_file *id3f = id3_file_open(file, ID3_FILE_MODE_READWRITE);
     if (id3f == NULL) {
         return;
     }
@@ -72,7 +84,7 @@ void fix(const char *file) {
     int replacements = 0;
     for (int i = 0; i < tag->nframes; i++) {
         struct id3_frame *frm = tag->frames[i];
-        if (frm->id[0] != 'T') {
+        if (frm->id[0] != 'T' || (frm->encoded && frm->encoded_length)) {
             continue;
         }
         fprintf(stderr, "  frame %.4s; nfields:%3u\n", frm->id, frm->nfields);
@@ -85,23 +97,35 @@ void fix(const char *file) {
         }
         int text_enc = frm->fields[0].number.value;
         if (text_enc != ID3_FIELD_TEXTENCODING_ISO_8859_1) {
-            fprintf(stderr, "%s", "Text encoding not latin-1, leaving alone\n");
+            fprintf(stderr, "Text encoding not latin-1 (%d), leaving alone\n", text_enc);
             continue;
         }
-        int all_latin1 = 0;
+        int all_latin1 = 1;
         for (int j = 1; j < frm->nfields && all_latin1; j++) {
             union id3_field *fld = frm->fields + j;
             switch (fld->type) {
             case ID3_FIELD_TYPE_LATIN1:
-                all_latin1 = all_latin1 || check_latin1(fld->latin1.ptr, id3_strlen(fld->latin1.ptr));
+                all_latin1 = all_latin1 && check_latin1(fld->latin1.ptr, id3_latin1len(fld->latin1.ptr));
                 break;
             case ID3_FIELD_TYPE_LATIN1FULL:
-                all_latin1 = all_latin1 || check_latin1(fld->latin1.ptr, id3_strlen(fld->latin1.ptr));
+                all_latin1 = all_latin1 && check_latin1(fld->latin1.ptr, id3_latin1len(fld->latin1.ptr));
                 break;
             case ID3_FIELD_TYPE_LATIN1LIST:
-                for (size_t k = 0; k < fld->latin1list.nstrings && all_latin1; k++) {
-                    all_latin1 = all_latin1 || check_latin1(fld->latin1list.strings[k],
-                            id3_strlen(fld->latin1list.strings[k]));
+                for (size_t k = 0; k < fld->latin1list.nstrings && !all_latin1; k++) {
+                    all_latin1 = all_latin1 && check_latin1(fld->latin1list.strings[k],
+                            id3_latin1len(fld->latin1list.strings[k]));
+                }
+                break;
+            case ID3_FIELD_TYPE_STRING:
+                all_latin1 = all_latin1 && check_string(fld->string.ptr, id3_stringlen(fld->string.ptr));
+                break;
+            case ID3_FIELD_TYPE_STRINGFULL:
+                all_latin1 = all_latin1 && check_string(fld->string.ptr, id3_stringlen(fld->string.ptr));
+                break;
+            case ID3_FIELD_TYPE_STRINGLIST:
+                for (size_t k = 0; k < fld->stringlist.nstrings && all_latin1; k++) {
+                    all_latin1 = all_latin1 && check_string(fld->stringlist.strings[k],
+                            id3_stringlen(fld->stringlist.strings[k]));
                 }
                 break;
             default:
@@ -127,6 +151,15 @@ void fix(const char *file) {
             case ID3_FIELD_TYPE_LATIN1LIST:
                 fix_latin1list(fld);
                 break;
+            case ID3_FIELD_TYPE_STRING:
+                fix_string(fld);
+                break;
+            case ID3_FIELD_TYPE_STRINGFULL:
+                fix_stringfull(fld);
+                break;
+            case ID3_FIELD_TYPE_STRINGLIST:
+                fix_stringlist(fld);
+                break;
             default:
                 break;
             }
@@ -135,21 +168,25 @@ void fix(const char *file) {
     if (replacements) {
         id3_file_update(id3f);
     }
-    id3_tag_delete(tag);
     id3_file_close(id3f);
 }
 
 int check_latin1(const id3_latin1_t *text, size_t len) {
-    if (len == 0) {
-        return 1;
-    }
-
-    // first check if this is all alphanumerics though
     for (size_t i = 0; ; i++) {
-        if (text[i] < 0x20 || (text[i] > 0x7E && text[i] < 0xA1)) {
-            return 0;
-        } else if (i >= len) {
+        if (i >= len) {
             return 1;
+        } else if (text[i] < 0x20 || (text[i] > 0x7E && text[i] < 0xA1)) {
+            return 0;
+        }
+    }
+}
+
+int check_string(const id3_ucs4_t *text, size_t len) {
+    for (size_t i = 0; ; i++) {
+        if (i >= len) {
+            return 1;
+        } else if (text[i] < 0x20 || (text[i] > 0x7E && text[i] < 0xA0)) {
+            return 0;
         }
     }
 }
@@ -157,7 +194,7 @@ int check_latin1(const id3_latin1_t *text, size_t len) {
 int guess_enc_latin1(const id3_latin1_t *text, size_t len, id3_ucs4_t **otext, size_t *olen, int enchint) {
     size_t inbytesleft;
     size_t outbytesleft;
-    size_t tmpbufsz = len * 2;
+    size_t tmpbufsz = len * 4;
     char *tmpbuf = malloc(tmpbufsz);
     char *textin = malloc(len + 1);
     memcpy(textin, text, len);
@@ -167,14 +204,17 @@ int guess_enc_latin1(const id3_latin1_t *text, size_t len, id3_ucs4_t **otext, s
         puts("malloc fail!");
         exit(1);
     }
-    for (int ienc = enchint ? enchint - 1 : 0; !result && ENCODINGS[ienc]; ienc++) {
+    for (int ienc = enchint ? enchint - 1 : 0; !result && ENCODINGS[ienc];) {
         iconv_t cd = iconv_open("UCS-4BE", ENCODINGS[ienc]);
         iconv(cd, 0, 0, 0, 0);
         memset(tmpbuf, 0, tmpbufsz);
         inbytesleft = len;
         outbytesleft = tmpbufsz;
-        if (iconv(cd, &textin, &inbytesleft, &tmpbuf, &outbytesleft) != -1) {
-            *olen = tmpbufsz - outbytesleft;
+        char *textin2 = textin;
+        char *tmpbuf2 = tmpbuf;
+        size_t converted = iconv(cd, &textin2, &inbytesleft, &tmpbuf2, &outbytesleft);
+        if (converted != -1) {
+            *olen = (tmpbufsz - outbytesleft) / 4;
             fprintf(stderr, "Guessed encoding: %s\n", ENCODINGS[ienc]);
             result = ienc + 1;
         } else if (errno == E2BIG) {
@@ -182,27 +222,29 @@ int guess_enc_latin1(const id3_latin1_t *text, size_t len, id3_ucs4_t **otext, s
             tmpbufsz *= 2;
             tmpbuf = malloc(tmpbufsz);
             if (!tmpbuf) {
-                puts("malloc fail!");
+                fprintf(stderr, "%s", "malloc fail!");
                 exit(1);
             }
+        } else {
+            ienc++;
         }
         iconv_close(cd);
     }
-    free(textin);
     if (result) {
         *otext = (id3_ucs4_t *)malloc((*olen + 1) * sizeof(id3_ucs4_t));
         for (size_t i = 0; i < *olen; i++) {
             (*otext)[i] = (id3_ucs4_t) (
-                (id3_ucs4_t) tmpbuf[4 * i + 0] << 24 |
-                (id3_ucs4_t) tmpbuf[4 * i + 1] << 16 |
-                (id3_ucs4_t) tmpbuf[4 * i + 2] << 8 |
-                (id3_ucs4_t) tmpbuf[4 * i + 3]);
+                ((id3_ucs4_t) tmpbuf[4 * i + 0] & 0xFF) << 24 |
+                ((id3_ucs4_t) tmpbuf[4 * i + 1] & 0xFF) << 16 |
+                ((id3_ucs4_t) tmpbuf[4 * i + 2] & 0xFF) << 8 |
+                ((id3_ucs4_t) tmpbuf[4 * i + 3] & 0xFF));
         }
         (*otext)[*olen] = 0;
     } else {
         fprintf(stderr, "%s\n", "Failed to guess encoding");
-        free(tmpbuf);
     }
+    free(textin);
+    free(tmpbuf);
     return result;
 }
 
@@ -210,22 +252,22 @@ union id3_field *fix_latin1(union id3_field *fld) {
     id3_ucs4_t *text;
     size_t textlen;
     union id3_field fix;
-    if (guess_enc_latin1(fld->latin1.ptr, id3_strlen(fld->latin1.ptr), &text, &textlen, 0)) {
+    if (guess_enc_latin1(fld->latin1.ptr, id3_latin1len(fld->latin1.ptr), &text, &textlen, 0)) {
         fix.type = ID3_FIELD_TYPE_STRING;
         fix.string.ptr = text;
+        memcpy(fld, &fix, sizeof(union id3_field));
     }
-    memcpy(fld, &fix, sizeof(union id3_field));
     return fld;
 }
 union id3_field *fix_latin1full(union id3_field *fld) {
     id3_ucs4_t *text;
     size_t textlen;
     union id3_field fix;
-    if (guess_enc_latin1(fld->latin1.ptr, id3_strlen(fld->latin1.ptr), &text, &textlen, 0)) {
+    if (guess_enc_latin1(fld->latin1.ptr, id3_latin1len(fld->latin1.ptr), &text, &textlen, 0)) {
         fix.type = ID3_FIELD_TYPE_STRINGFULL;
         fix.string.ptr = text;
+        memcpy(fld, &fix, sizeof(union id3_field));
     }
-    memcpy(fld, &fix, sizeof(union id3_field));
     return fld;
 }
 union id3_field *fix_latin1list(union id3_field *fld) {
@@ -236,10 +278,72 @@ union id3_field *fix_latin1list(union id3_field *fld) {
     fix.stringlist.nstrings = fld->latin1list.nstrings;
     fix.stringlist.strings = (id3_ucs4_t **)malloc(fix.stringlist.nstrings * sizeof(id3_ucs4_t *));
     for (size_t i = 0; i < fld->latin1list.nstrings; i++) {
-        if (!guess_enc_latin1(fld->latin1list.strings[i], id3_strlen(fld->latin1list.strings[i]),
+        if (!guess_enc_latin1(fld->latin1list.strings[i], id3_latin1len(fld->latin1list.strings[i]),
                 &text, &textlen, 0)) {
             return fld;
         }
+        fix.stringlist.strings[i] = text;
+    }
+    memcpy(fld, &fix, sizeof(union id3_field));
+    return fld;
+}
+
+static void ucs4_to_latin1(const id3_ucs4_t *text, size_t textsz,
+        id3_latin1_t **latintext, size_t *latintextsz) {
+    *latintext = (id3_latin1_t *)malloc((textsz + 1) * sizeof(id3_latin1_t));
+    for (size_t i = 0; i < textsz; i++) {
+        (*latintext)[i] = (id3_latin1_t)(text[i] & 0xFF);
+    }
+    (*latintext)[textsz] = 0;
+    *latintextsz = textsz;
+}
+
+union id3_field *fix_string(union id3_field *fld) {
+    id3_latin1_t *latintext;
+    size_t latintextsz;
+    id3_ucs4_t *text;
+    size_t textlen;
+    union id3_field fix;
+    ucs4_to_latin1(fld->string.ptr, id3_stringlen(fld->string.ptr), &latintext, &latintextsz);
+    if (guess_enc_latin1(latintext, latintextsz, &text, &textlen, 0)) {
+        fix.type = ID3_FIELD_TYPE_STRING;
+        fix.string.ptr = text;
+        memcpy(fld, &fix, sizeof(union id3_field));
+    }
+    free(latintext);
+    return fld;
+}
+union id3_field *fix_stringfull(union id3_field *fld) {
+    id3_latin1_t *latintext;
+    size_t latintextsz;
+    id3_ucs4_t *text;
+    size_t textlen;
+    union id3_field fix;
+    ucs4_to_latin1(fld->string.ptr, id3_stringlen(fld->string.ptr), &latintext, &latintextsz);
+    if (guess_enc_latin1(latintext, latintextsz, &text, &textlen, 0)) {
+        fix.type = ID3_FIELD_TYPE_STRINGFULL;
+        fix.string.ptr = text;
+        memcpy(fld, &fix, sizeof(union id3_field));
+    }
+    free(latintext);
+    return fld;
+}
+union id3_field *fix_stringlist(union id3_field *fld) {
+    id3_ucs4_t *text;
+    size_t textlen;
+    union id3_field fix;
+    fix.type = ID3_FIELD_TYPE_STRINGLIST;
+    fix.stringlist.nstrings = fld->latin1list.nstrings;
+    fix.stringlist.strings = (id3_ucs4_t **)malloc(fix.stringlist.nstrings * sizeof(id3_ucs4_t *));
+    for (size_t i = 0; i < fld->stringlist.nstrings; i++) {
+        id3_latin1_t *latintext;
+        size_t latintextsz;
+        ucs4_to_latin1(fld->stringlist.strings[i], id3_stringlen(fld->stringlist.strings[i]),
+                &latintext, &latintextsz);
+        if (!guess_enc_latin1(latintext, latintextsz, &text, &textlen, 0)) {
+            return fld;
+        }
+        free(latintext);
         fix.stringlist.strings[i] = text;
     }
     memcpy(fld, &fix, sizeof(union id3_field));
